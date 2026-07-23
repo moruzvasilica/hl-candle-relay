@@ -16,7 +16,11 @@ from datetime import datetime, timezone
 import requests
 
 API = "https://api.hyperliquid.xyz/info"
-ASSETS = ["BTC", "ETH", "SOL", "HYPE"]
+ASSETS = [
+    "BTC", "ETH", "XRP", "BNB", "SOL",
+    "DOGE", "ADA", "TRX", "LINK", "AVAX",
+    "SUI", "HYPE", "LTC", "DOT", "BCH",
+]  # superset; the routine selects top-10 by Trend Radar marketRank + HYPE pinned
 TIMEFRAMES = {"15m": 15 * 60, "1h": 3600, "4h": 4 * 3600}
 KEEP = 260          # candles kept per asset per timeframe (strategy needs >= 250)
 OUT_DIR = "data"
@@ -102,6 +106,7 @@ def main():
     }
     for asset in ASSETS:
         for tf, secs in TIMEFRAMES.items():
+            time.sleep(0.3)  # politeness delay for the public API
             key = f"{asset}_{tf}"
             try:
                 rows = fetch_candles(asset, tf, secs, now_ms)
