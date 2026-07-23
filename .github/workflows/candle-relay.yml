@@ -1,10 +1,9 @@
-# Place at .github/workflows/candle-relay.yml
 name: candle-relay
 
 on:
   schedule:
-    - cron: "1 * * * *"      # every hour at :01 UTC (may start a few min late)
-  workflow_dispatch: {}       # manual trigger for testing
+    - cron: "1 * * * *"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
