@@ -1,0 +1,37 @@
+{
+ "schema": 1,
+ "source": "hyperliquid",
+ "generatedAtUtc": "2026-07-23T09:24:02+00:00",
+ "assets": [
+  "BTC",
+  "ETH",
+  "SOL",
+  "HYPE"
+ ],
+ "timeframes": [
+  "15m",
+  "1h",
+  "4h"
+ ],
+ "files": {
+  "BTC_15m": "BTC_15m.json",
+  "BTC_1h": "BTC_1h.json",
+  "BTC_4h": "BTC_4h.json",
+  "ETH_15m": "ETH_15m.json",
+  "ETH_1h": "ETH_1h.json",
+  "ETH_4h": "ETH_4h.json",
+  "SOL_15m": "SOL_15m.json",
+  "SOL_1h": "SOL_1h.json",
+  "SOL_4h": "SOL_4h.json",
+  "HYPE_15m": "HYPE_15m.json",
+  "HYPE_1h": "HYPE_1h.json",
+  "HYPE_4h": "HYPE_4h.json"
+ },
+ "funding": {
+  "BTC": 1.25e-05,
+  "ETH": 1.25e-05,
+  "SOL": 9.5403e-06,
+  "HYPE": 1.25e-05
+ },
+ "errors": []
+}
