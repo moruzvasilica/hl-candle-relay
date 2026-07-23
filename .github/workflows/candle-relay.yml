@@ -1,0 +1,39 @@
+# Place at .github/workflows/candle-relay.yml
+name: candle-relay
+
+on:
+  schedule:
+    - cron: "1 * * * *"      # every hour at :01 UTC (may start a few min late)
+  workflow_dispatch: {}       # manual trigger for testing
+
+permissions:
+  contents: write
+
+concurrency:
+  group: candle-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch Hyperliquid candles + funding
+        run: python fetch_candles.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "candle-relay"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet || git commit -m "candles $(date -u +'%Y-%m-%dT%H:%M')Z"
+          git push
