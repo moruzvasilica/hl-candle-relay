@@ -2,7 +2,11 @@ name: candle-relay
 
 on:
   schedule:
-    - cron: "1 * * * *"
+    # Every 15 min. GitHub's scheduler is best-effort and routinely runs
+    # 20-45 min late, so a consumer needing <75-min-old data cannot rely
+    # on an hourly trigger. At */15, two consecutive skipped runs still
+    # leave data ~45 min old.
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -10,29 +14,88 @@ permissions:
 
 concurrency:
   group: candle-relay
-  cancel-in-progress: false
+  # Fresh data beats finishing a stale run. A hung job must not block
+  # the queue at this frequency.
+  cancel-in-progress: true
 
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
         run: pip install requests
 
-      - name: Fetch Hyperliquid candles + funding
-        run: python fetch_candles.py
+      - name: Fetch Hyperliquid candles + funding (3 attempts)
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::fetch attempt $attempt"
+            if python fetch_candles.py; then
+              echo "::endgroup::"
+              echo "fetch succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "attempt $attempt failed"
+            [ "$attempt" -lt 3 ] && sleep 15
+          done
+          echo "::error::fetch_candles.py failed after 3 attempts"
+          exit 1
+
+      - name: Verify manifest is fresh
+        # Guard against a silent partial write: if the script exits 0 but
+        # leaves a stale or malformed manifest, fail loudly here rather
+        # than committing bad data.
+        run: |
+          python - <<'PY'
+          import json, sys
+          from datetime import datetime, timezone
+
+          with open("data/manifest.json") as f:
+              m = json.load(f)
+
+          if m.get("errors"):
+              sys.exit(f"manifest reports errors: {m['errors']}")
+
+          gen = datetime.fromisoformat(m["generatedAtUtc"])
+          age = (datetime.now(timezone.utc) - gen).total_seconds() / 60
+          print(f"manifest age: {age:.1f} min, {len(m.get('assets', []))} assets")
+
+          if age > 5:
+              sys.exit(f"manifest not refreshed by this run (age {age:.1f} min)")
+          if len(m.get("assets", [])) < 10:
+              sys.exit(f"manifest has only {len(m.get('assets', []))} assets")
+          PY
 
       - name: Commit and push if changed
         run: |
           git config user.name "candle-relay"
           git config user.email "actions@users.noreply.github.com"
           git add data
-          git diff --cached --quiet || git commit -m "candles $(date -u +'%Y-%m-%dT%H:%M')Z"
-          git push
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+          git commit -m "candles $(date -u +'%Y-%m-%dT%H:%M')Z"
+
+          # Push with rebase-and-retry. Without this, any concurrent commit
+          # on main rejects the push, the job fails, and the manifest never
+          # updates -- silently costing a full trading window.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "push succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "push rejected on attempt $attempt, rebasing"
+            git pull --rebase --autostash origin main || true
+            sleep $((attempt * 3))
+          done
+          echo "::error::git push failed after 5 attempts"
+          exit 1
