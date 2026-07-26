@@ -1,101 +1,130 @@
-name: candle-relay
+#!/usr/bin/env python3
+"""Hyperliquid candle relay.
 
-on:
-  schedule:
-    # Every 15 min. GitHub's scheduler is best-effort and routinely runs
-    # 20-45 min late, so a consumer needing <75-min-old data cannot rely
-    # on an hourly trigger. At */15, two consecutive skipped runs still
-    # leave data ~45 min old.
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+Fetches fully CLOSED 15m/1h/4h candles + current funding for BTC/ETH/SOL/HYPE
+from Hyperliquid's public API and writes compact JSON files under data/.
+Consumed by the TR-F5-Crypto-LS-1H-03 routine via raw.githubusercontent.com.
 
-permissions:
-  contents: write
+No API keys. Public market data only.
+"""
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
 
-concurrency:
-  group: candle-relay
-  # Fresh data beats finishing a stale run. A hung job must not block
-  # the queue at this frequency.
-  cancel-in-progress: true
+import requests
 
-jobs:
-  relay:
-    runs-on: ubuntu-latest
-    timeout-minutes: 6
-    steps:
-      - uses: actions/checkout@v4
+API = "https://api.hyperliquid.xyz/info"
+ASSETS = [
+    "BTC", "ETH", "XRP", "BNB", "SOL",
+    "DOGE", "ADA", "TRX", "LINK", "AVAX",
+    "SUI", "HYPE", "LTC", "DOT", "BCH",
+]  # superset; the routine selects top-10 by Trend Radar marketRank + HYPE pinned
+TIMEFRAMES = {"15m": 15 * 60, "1h": 3600, "4h": 4 * 3600}
+KEEP = 260          # candles kept per asset per timeframe (strategy needs >= 250)
+OUT_DIR = "data"
+SCHEMA = 1
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+def post(payload, retries=3, wait=5):
+    last = None
+    for attempt in range(retries):
+        try:
+            r = requests.post(API, json=payload, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:  # noqa: BLE001 - relay must degrade gracefully
+            last = exc
+            if attempt < retries - 1:
+                time.sleep(wait)
+    raise RuntimeError(f"Hyperliquid request failed after {retries} tries: {last}")
 
-      - name: Fetch Hyperliquid candles + funding (3 attempts)
-        run: |
-          for attempt in 1 2 3; do
-            echo "::group::fetch attempt $attempt"
-            if python fetch_candles.py; then
-              echo "::endgroup::"
-              echo "fetch succeeded on attempt $attempt"
-              exit 0
-            fi
-            echo "::endgroup::"
-            echo "attempt $attempt failed"
-            [ "$attempt" -lt 3 ] && sleep 15
-          done
-          echo "::error::fetch_candles.py failed after 3 attempts"
-          exit 1
 
-      - name: Verify manifest is fresh
-        # Guard against a silent partial write: if the script exits 0 but
-        # leaves a stale or malformed manifest, fail loudly here rather
-        # than committing bad data.
-        run: |
-          python - <<'PY'
-          import json, sys
-          from datetime import datetime, timezone
+def fetch_candles(coin, interval, secs, now_ms):
+    start = now_ms - (KEEP + 20) * secs * 1000
+    raw = post({
+        "type": "candleSnapshot",
+        "req": {"coin": coin, "interval": interval,
+                "startTime": start, "endTime": now_ms},
+    })
+    rows = []
+    for c in raw if isinstance(raw, list) else []:
+        try:
+            row = {
+                "t": int(c["t"]),          # open time (ms, UTC)
+                "T": int(c["T"]),          # close time (ms, UTC)
+                "o": float(c["o"]),
+                "h": float(c["h"]),
+                "l": float(c["l"]),
+                "c": float(c["c"]),
+                "v": float(c["v"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        if row["T"] <= now_ms:             # fully closed candles only
+            rows.append(row)
+    rows.sort(key=lambda r: r["t"])
+    seen, deduped = set(), []
+    for r in rows:
+        if r["t"] in seen:
+            continue
+        seen.add(r["t"])
+        deduped.append(r)
+    return deduped[-KEEP:]
 
-          with open("data/manifest.json") as f:
-              m = json.load(f)
 
-          if m.get("errors"):
-              sys.exit(f"manifest reports errors: {m['errors']}")
+def fetch_funding():
+    """Current hourly funding rate per asset (positive = longs pay shorts)."""
+    try:
+        meta, ctxs = post({"type": "metaAndAssetCtxs"})
+        names = [u.get("name") for u in meta.get("universe", [])]
+        out = {}
+        for name, ctx in zip(names, ctxs):
+            if name in ASSETS:
+                try:
+                    out[name] = float(ctx.get("funding"))
+                except (TypeError, ValueError):
+                    pass
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
 
-          gen = datetime.fromisoformat(m["generatedAtUtc"])
-          age = (datetime.now(timezone.utc) - gen).total_seconds() / 60
-          print(f"manifest age: {age:.1f} min, {len(m.get('assets', []))} assets")
 
-          if age > 5:
-              sys.exit(f"manifest not refreshed by this run (age {age:.1f} min)")
-          if len(m.get("assets", [])) < 10:
-              sys.exit(f"manifest has only {len(m.get('assets', []))} assets")
-          PY
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    now_ms = int(time.time() * 1000)
+    manifest = {
+        "schema": SCHEMA,
+        "source": "hyperliquid",
+        "generatedAtUtc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "assets": ASSETS,
+        "timeframes": list(TIMEFRAMES),
+        "files": {},
+        "funding": fetch_funding(),
+        "errors": [],
+    }
+    for asset in ASSETS:
+        for tf, secs in TIMEFRAMES.items():
+            time.sleep(0.3)  # politeness delay for the public API
+            key = f"{asset}_{tf}"
+            try:
+                rows = fetch_candles(asset, tf, secs, now_ms)
+            except Exception as exc:  # noqa: BLE001
+                manifest["errors"].append(f"{key}: {exc}")
+                print(f"FAIL {key}: {exc}", file=sys.stderr)
+                continue
+            if len(rows) < 200:
+                manifest["errors"].append(f"{key}: only {len(rows)} candles")
+            filename = f"{key}.json"
+            with open(os.path.join(OUT_DIR, filename), "w") as fh:
+                json.dump({"asset": asset, "interval": tf, "candles": rows},
+                          fh, separators=(",", ":"))
+            manifest["files"][key] = filename
+    with open(os.path.join(OUT_DIR, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    print(f"OK files={len(manifest['files'])} errors={len(manifest['errors'])}")
 
-      - name: Commit and push if changed
-        run: |
-          git config user.name "candle-relay"
-          git config user.email "actions@users.noreply.github.com"
-          git add data
-          if git diff --cached --quiet; then
-            echo "no changes to commit"
-            exit 0
-          fi
-          git commit -m "candles $(date -u +'%Y-%m-%dT%H:%M')Z"
 
-          # Push with rebase-and-retry. Without this, any concurrent commit
-          # on main rejects the push, the job fails, and the manifest never
-          # updates -- silently costing a full trading window.
-          for attempt in 1 2 3 4 5; do
-            if git push; then
-              echo "push succeeded on attempt $attempt"
-              exit 0
-            fi
-            echo "push rejected on attempt $attempt, rebasing"
-            git pull --rebase --autostash origin main || true
-            sleep $((attempt * 3))
-          done
-          echo "::error::git push failed after 5 attempts"
-          exit 1
+if __name__ == "__main__":
+    main()
