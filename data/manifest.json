@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "source": "hyperliquid",
- "generatedAtUtc": "2026-07-26T23:45:01+00:00",
+ "generatedAtUtc": "2026-07-27T01:22:37+00:00",
  "assets": [
   "BTC",
   "ETH",
@@ -72,20 +72,20 @@
   "BCH_4h": "BCH_4h.json"
  },
  "funding": {
-  "BTC": 1.25e-05,
+  "BTC": 8.577e-06,
   "ETH": 1.25e-05,
   "SOL": 1.25e-05,
-  "AVAX": 1.25e-05,
+  "AVAX": 1.00311e-05,
   "BNB": 1.25e-05,
   "LTC": 1.25e-05,
   "DOGE": 1.25e-05,
-  "SUI": 9.925e-06,
+  "SUI": 8.2626e-06,
   "LINK": 1.25e-05,
-  "XRP": 1.05338e-05,
-  "BCH": -1.66686e-05,
-  "TRX": 4.478e-06,
+  "XRP": 7.8287e-06,
+  "BCH": 3.53e-06,
+  "TRX": 1.25e-05,
   "DOT": 1.25e-05,
-  "ADA": -1.20681e-05,
+  "ADA": -2.19013e-05,
   "HYPE": 1.25e-05
  },
  "errors": []
