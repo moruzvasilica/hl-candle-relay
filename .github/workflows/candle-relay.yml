@@ -2,100 +2,273 @@ name: candle-relay
 
 on:
   schedule:
-    # Every 15 min. GitHub's scheduler is best-effort and routinely runs
-    # 20-45 min late, so a consumer needing <75-min-old data cannot rely
-    # on an hourly trigger. At */15, two consecutive skipped runs still
-    # leave data ~45 min old.
-    - cron: "*/15 * * * *"
+    # Offsets avoid the busiest top-of-hour GitHub scheduler periods.
+    # Runs four times per hour: :05, :20, :35 and :50 UTC.
+    - cron: "5,20,35,50 * * * *"
+
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 concurrency:
-  group: candle-relay
-  # Fresh data beats finishing a stale run. A hung job must not block
-  # the queue at this frequency.
+  group: candle-relay-main
   cancel-in-progress: true
 
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 8
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Fetch Hyperliquid candles + funding (3 attempts)
         run: |
-          for attempt in 1 2 3; do
-            echo "::group::fetch attempt $attempt"
-            if python fetch_candles.py; then
-              echo "::endgroup::"
-              echo "fetch succeeded on attempt $attempt"
-              exit 0
-            fi
-            echo "::endgroup::"
-            echo "attempt $attempt failed"
-            [ "$attempt" -lt 3 ] && sleep 15
-          done
-          echo "::error::fetch_candles.py failed after 3 attempts"
-          exit 1
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Verify manifest is fresh
-        # Guard against a silent partial write: if the script exits 0 but
-        # leaves a stale or malformed manifest, fail loudly here rather
-        # than committing bad data.
+      - name: Fetch and validate Hyperliquid relay
+        shell: bash
         run: |
-          python - <<'PY'
-          import json, sys
+          set -euo pipefail
+
+          validate_manifest() {
+            python - <<'PY'
+          import json
+          import sys
           from datetime import datetime, timezone
 
-          with open("data/manifest.json") as f:
-              m = json.load(f)
+          manifest_path = "data/manifest.json"
 
-          if m.get("errors"):
-              sys.exit(f"manifest reports errors: {m['errors']}")
+          try:
+              with open(manifest_path, "r", encoding="utf-8") as handle:
+                  manifest = json.load(handle)
+          except Exception as exc:
+              sys.exit(f"Cannot read manifest: {type(exc).__name__}: {exc}")
 
-          gen = datetime.fromisoformat(m["generatedAtUtc"])
-          age = (datetime.now(timezone.utc) - gen).total_seconds() / 60
-          print(f"manifest age: {age:.1f} min, {len(m.get('assets', []))} assets")
+          if manifest.get("schema") != 1:
+              sys.exit(
+                  f"Unexpected schema: {manifest.get('schema')!r}"
+              )
 
-          if age > 5:
-              sys.exit(f"manifest not refreshed by this run (age {age:.1f} min)")
-          if len(m.get("assets", [])) < 10:
-              sys.exit(f"manifest has only {len(m.get('assets', []))} assets")
+          if manifest.get("source") != "hyperliquid":
+              sys.exit(
+                  f"Unexpected source: {manifest.get('source')!r}"
+              )
+
+          generated_raw = manifest.get("generatedAtUtc")
+
+          if not generated_raw:
+              sys.exit("generatedAtUtc is missing")
+
+          try:
+              generated = datetime.fromisoformat(
+                  generated_raw.replace("Z", "+00:00")
+              )
+          except ValueError as exc:
+              sys.exit(
+                  f"Invalid generatedAtUtc: {generated_raw!r}: {exc}"
+              )
+
+          if generated.tzinfo is None:
+              sys.exit("generatedAtUtc is not timezone-aware")
+
+          age_minutes = (
+              datetime.now(timezone.utc) - generated
+          ).total_seconds() / 60
+
+          errors = manifest.get("errors") or []
+          warnings = manifest.get("warnings") or []
+          health = manifest.get("health")
+          files = manifest.get("files") or {}
+          file_meta = manifest.get("fileMeta") or {}
+
+          expected_count = manifest.get("expectedFileCount")
+          successful_count = manifest.get("successfulFileCount")
+
+          print(
+              f"manifest age={age_minutes:.2f} min "
+              f"health={health} "
+              f"files={successful_count}/{expected_count} "
+              f"errors={len(errors)} "
+              f"warnings={len(warnings)}"
+          )
+
+          if age_minutes < -2:
+              sys.exit(
+                  f"Manifest timestamp is in the future: "
+                  f"{age_minutes:.2f} min"
+              )
+
+          if age_minutes > 5:
+              sys.exit(
+                  f"Manifest was not refreshed by this run: "
+                  f"age={age_minutes:.2f} min"
+              )
+
+          if health != "ok":
+              sys.exit(
+                  f"Manifest health is not ok: {health!r}"
+              )
+
+          if errors:
+              sys.exit(
+                  f"Manifest reports errors: {errors}"
+              )
+
+          if expected_count != 45:
+              sys.exit(
+                  f"Unexpected expectedFileCount: {expected_count}"
+              )
+
+          if successful_count != expected_count:
+              sys.exit(
+                  f"Incomplete relay: "
+                  f"{successful_count}/{expected_count}"
+              )
+
+          if len(files) != expected_count:
+              sys.exit(
+                  f"files contains {len(files)} entries, "
+                  f"expected {expected_count}"
+              )
+
+          critical_keys = (
+              "BTC_15m",
+              "BTC_1h",
+              "BTC_4h",
+          )
+
+          for key in critical_keys:
+              if key not in files:
+                  sys.exit(
+                      f"Critical file missing from manifest: {key}"
+                  )
+
+              metadata = file_meta.get(key)
+
+              if not isinstance(metadata, dict):
+                  sys.exit(
+                      f"fileMeta missing for critical key: {key}"
+                  )
+
+              if not metadata.get("minimumCountMet"):
+                  sys.exit(
+                      f"Minimum candle count not met for {key}"
+                  )
+
+              close_age = metadata.get(
+                  "latestCloseAgeMinutesAtFetch"
+              )
+
+              if not isinstance(close_age, (int, float)):
+                  sys.exit(
+                      f"Missing candle-close age for {key}"
+                  )
+
+          # Freshness limits at the moment the relay fetched the data.
+          freshness_limits = {
+              "BTC_15m": 40,
+              "BTC_1h": 100,
+              "BTC_4h": 300,
+          }
+
+          for key, maximum_age in freshness_limits.items():
+              close_age = file_meta[key][
+                  "latestCloseAgeMinutesAtFetch"
+              ]
+
+              if close_age > maximum_age:
+                  sys.exit(
+                      f"{key} candle data is stale: "
+                      f"{close_age:.2f} min > {maximum_age} min"
+                  )
+
+          print("manifest validation passed")
           PY
+          }
 
-      - name: Commit and push if changed
+          success=0
+
+          for attempt in 1 2 3; do
+            echo "::group::relay attempt $attempt"
+
+            rm -f data/manifest.json
+
+            if python fetch_candles.py && validate_manifest; then
+              echo "relay fetch and validation succeeded on attempt $attempt"
+              success=1
+              echo "::endgroup::"
+              break
+            fi
+
+            echo "relay attempt $attempt failed"
+            echo "::endgroup::"
+
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+
+          if [ "$success" -ne 1 ]; then
+            echo "::error::relay failed validation after 3 attempts"
+            exit 1
+          fi
+
+      - name: Commit and push updated relay data
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "candle-relay"
           git config user.email "actions@users.noreply.github.com"
+
           git add data
+
           if git diff --cached --quiet; then
-            echo "no changes to commit"
+            echo "No relay changes to commit"
             exit 0
           fi
-          git commit -m "candles $(date -u +'%Y-%m-%dT%H:%M')Z"
 
-          # Push with rebase-and-retry. Without this, any concurrent commit
-          # on main rejects the push, the job fails, and the manifest never
-          # updates -- silently costing a full trading window.
+          git commit -m "candles $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
           for attempt in 1 2 3 4 5; do
-            if git push; then
-              echo "push succeeded on attempt $attempt"
+            echo "Push attempt $attempt"
+
+            if git push origin HEAD:main; then
+              echo "Push succeeded on attempt $attempt"
               exit 0
             fi
-            echo "push rejected on attempt $attempt, rebasing"
-            git pull --rebase --autostash origin main || true
+
+            echo "Push rejected; synchronizing with origin/main"
+
+            git rebase --abort 2>/dev/null || true
+
+            if ! git fetch origin main; then
+              echo "git fetch failed"
+              sleep $((attempt * 3))
+              continue
+            fi
+
+            if ! git rebase origin/main; then
+              echo "Rebase failed; aborting cleanly"
+              git rebase --abort 2>/dev/null || true
+              exit 1
+            fi
+
             sleep $((attempt * 3))
           done
+
           echo "::error::git push failed after 5 attempts"
           exit 1
